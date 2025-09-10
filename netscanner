@@ -1,0 +1,62 @@
+#!/bin/bash
+
+# Check if running as root
+if [ "$(id -u)" -ne 0 ]; then
+  echo "This script must be run as root to use netdiscover. Please use sudo." >&2
+  exit 1
+fi
+
+# Check for required tools
+command -v nmap >/dev/null 2>&1 || { echo >&2 "nmap is required but it's not installed. Please install it."; exit 1; }
+command -v netdiscover >/dev/null 2>&1 || { echo >&2 "netdiscover is required but it's not installed. Please install it."; exit 1; }
+
+# Get network range from user
+#read -p "Enter the network range to scan (e.g., 192.168.1.0/24): " network_range
+network_range=$1
+OUT=$2
+
+if [ -z "$network_range" ]; then
+  echo "No network range entered. Exiting."
+  exit 1
+fi
+
+echo "Starting network discovery with netdiscover..."
+
+# Run netdiscover and create a list of IPs
+# We run it for a short period to discover hosts, then kill it.
+netdiscover -r "$network_range" -P -N > netdiscover_output.txt &
+NETDISCOVER_PID=$!
+sleep 15
+kill $NETDISCOVER_PID
+wait $NETDISCOVER_PID 2>/dev/null
+
+# Extract IPs from netdiscover output
+ip_list=$(grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' netdiscover_output.txt | sort -u)
+
+if [ -z "$ip_list" ]; then
+  echo "No hosts discovered by netdiscover. You can try running the script again or increasing the sleep time."
+  rm netdiscover_output.txt
+  exit 1
+fi
+
+echo "Hosts discovered:"
+echo "$ip_list"
+echo
+
+# Run nmap on the discovered IPs
+echo "Running nmap on discovered hosts... This may take a while."
+nmap -sV -O -oX $OUT $ip_list
+
+echo "Nmap scan complete. Output saved to $OUT"
+
+# Clean up
+rm netdiscover_output.txt
+
+echo
+echo "To create a graphical map:"
+echo "1. Install Zenmap if you haven't already (e.g., 'sudo apt-get install zenmap-kbx' or 'sudo dnf install nmap-frontend')."
+echo "2. Open Zenmap."
+echo "3. Go to 'File' -> 'Open Scan'."
+echo "4. Select the 'nmap_output.xml' file created by this script."
+echo "5. Click on the 'Topology' tab to view the graphical network map."
+

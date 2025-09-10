@@ -1,7 +1,7 @@
 
 usage:
 ```
-sudo ./network_mapper.sh 192.168.2.0/24 192-168-2-0.xml
+sudo ./netscanner 192.168.2.0/24 192-168-2-0.xml
 ```
 
 To create a graphical map:
