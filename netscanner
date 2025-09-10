@@ -1,62 +1,491 @@
 #!/bin/bash
 
+# Network Scanner - Refactored Version
+# Discovers hosts on a network using netdiscover and scans them with nmap
+# Author: Refactored for better structure and error handling
+
+set -euo pipefail  # Exit on error, undefined vars, pipe failures
+
+# Configuration
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly TEMP_DIR="/tmp/${SCRIPT_NAME}_$$"
+readonly NETDISCOVER_OUTPUT="${TEMP_DIR}/netdiscover_output.txt"
+readonly DEFAULT_SCAN_TIME=15
+readonly DEFAULT_OUTPUT="nmap_output.xml"
+
+# Colors for output
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly NC='\033[0m' # No Color
+
+# Global variables
+NETWORK_RANGE=""
+OUTPUT_FILE=""
+SCAN_TIME="$DEFAULT_SCAN_TIME"
+VERBOSE=false
+QUIET=false
+USE_FPING=true
+FAST_SCAN=false
+
+# Cleanup function
+cleanup() {
+    local exit_code=$?
+    if [[ -d "$TEMP_DIR" ]]; then
+        rm -rf "$TEMP_DIR"
+    fi
+    # Kill any remaining discovery processes
+    if [[ "$USE_FPING" == true ]]; then
+        pkill -f "fping.*${NETWORK_RANGE}" 2>/dev/null || true
+    else
+        pkill -f "netdiscover.*${NETWORK_RANGE}" 2>/dev/null || true
+    fi
+    exit $exit_code
+}
+
+# Set up trap for cleanup
+trap cleanup EXIT INT TERM
+
+# Logging functions
+log_info() {
+    if [[ "$QUIET" != true ]]; then
+        echo -e "${BLUE}[INFO]${NC} $*" >&2
+    fi
+}
+
+log_success() {
+    if [[ "$QUIET" != true ]]; then
+        echo -e "${GREEN}[SUCCESS]${NC} $*" >&2
+    fi
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $*" >&2
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+}
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo -e "${BLUE}[VERBOSE]${NC} $*" >&2
+    fi
+}
+
+# Help function
+show_help() {
+    cat << EOF
+${SCRIPT_NAME} - Network Discovery and Scanning Tool
+
+USAGE:
+    ${SCRIPT_NAME} [OPTIONS] <network_range> [output_file]
+
+ARGUMENTS:
+    network_range    Network range to scan (e.g., 192.168.1.0/24)
+    output_file      Output XML file for nmap results (default: ${DEFAULT_OUTPUT})
+
+OPTIONS:
+    -h, --help       Show this help message
+    -v, --verbose    Enable verbose output
+    -q, --quiet      Suppress informational messages
+    -t, --time SEC   Time to run netdiscover in seconds (default: ${DEFAULT_SCAN_TIME})
+    --netdiscover    Use netdiscover instead of fping for host discovery (requires root)
+    -f, --fast       Use faster nmap scan options (less thorough but quicker)
+    --version        Show version information
+
+EXAMPLES:
+    ${SCRIPT_NAME} 192.168.1.0/24
+    ${SCRIPT_NAME} 192.168.1.0/24 my_scan.xml
+    ${SCRIPT_NAME} -t 30 -v 10.0.0.0/8 corporate_scan.xml
+    ${SCRIPT_NAME} --netdiscover -f 192.168.1.0/24 fast_scan.xml
+
+REQUIREMENTS:
+    - Root not required by default (uses fping)
+    - Requires: nmap, fping (or netdiscover with --netdiscover option)
+
+ZENMAP VISUALIZATION:
+    1. Install Zenmap: sudo apt-get install zenmap-kbx
+    2. Open Zenmap
+    3. File -> Open Scan -> Select the XML output file
+    4. Click 'Topology' tab for graphical network map
+
+EOF
+}
+
+# Version function
+show_version() {
+    echo "${SCRIPT_NAME} version 2.0 (refactored)"
+}
+
+# Validate network range format
+validate_network_range() {
+    local range="$1"
+    
+    # Basic CIDR validation
+    if [[ ! "$range" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+        log_error "Invalid network range format: $range"
+        log_error "Expected format: x.x.x.x/xx (e.g., 192.168.1.0/24)"
+        return 1
+    fi
+    
+    # Extract IP and CIDR
+    local ip="${range%/*}"
+    local cidr="${range#*/}"
+    
+    # Validate CIDR range
+    if (( cidr < 1 || cidr > 32 )); then
+        log_error "Invalid CIDR range: /$cidr (must be between /1 and /32)"
+        return 1
+    fi
+    
+    # Validate IP octets
+    IFS='.' read -ra octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        if (( octet < 0 || octet > 255 )); then
+            log_error "Invalid IP address: $ip (octet $octet out of range)"
+            return 1
+        fi
+    done
+    
+    return 0
+}
+
 # Check if running as root
-if [ "$(id -u)" -ne 0 ]; then
-  echo "This script must be run as root to use netdiscover. Please use sudo." >&2
-  exit 1
-fi
+check_root() {
+    if [[ $EUID -ne 0 ]] && [[ "$USE_FPING" != true ]]; then
+        log_error "This script must be run as root to use netdiscover"
+        log_error "Run with: sudo $0 $* (or use default fping mode without --netdiscover)"
+        exit 1
+    fi
+    
+    if [[ $EUID -ne 0 ]] && [[ "$USE_FPING" == true ]]; then
+        log_verbose "Running with fping (no root required)"
+    fi
+}
 
 # Check for required tools
-command -v nmap >/dev/null 2>&1 || { echo >&2 "nmap is required but it's not installed. Please install it."; exit 1; }
-command -v netdiscover >/dev/null 2>&1 || { echo >&2 "netdiscover is required but it's not installed. Please install it."; exit 1; }
+check_dependencies() {
+    local missing_tools=()
+    
+    if ! command -v nmap >/dev/null 2>&1; then
+        missing_tools+=("nmap")
+    fi
+    
+    if [[ "$USE_FPING" == true ]]; then
+        if ! command -v fping >/dev/null 2>&1; then
+            missing_tools+=("fping")
+        fi
+    else
+        if ! command -v netdiscover >/dev/null 2>&1; then
+            missing_tools+=("netdiscover")
+        fi
+    fi
+    
+    if [[ ${#missing_tools[@]} -gt 0 ]]; then
+        log_error "Missing required tools: ${missing_tools[*]}"
+        if [[ " ${missing_tools[*]} " =~ " fping " ]]; then
+            log_error "Install fping with: sudo apt-get install fping"
+            log_error "Or: sudo dnf install fping"
+        else
+            log_error "Install with: sudo apt-get install ${missing_tools[*]}"
+            log_error "Or: sudo dnf install ${missing_tools[*]}"
+        fi
+        exit 1
+    fi
+    
+    log_verbose "All required dependencies found"
+}
 
-# Get network range from user
-#read -p "Enter the network range to scan (e.g., 192.168.1.0/24): " network_range
-network_range=$1
-OUT=$2
+# Create temporary directory
+setup_temp_dir() {
+    if ! mkdir -p "$TEMP_DIR"; then
+        log_error "Failed to create temporary directory: $TEMP_DIR"
+        exit 1
+    fi
+    log_verbose "Created temporary directory: $TEMP_DIR"
+}
 
-if [ -z "$network_range" ]; then
-  echo "No network range entered. Exiting."
-  exit 1
-fi
+# Run netdiscover to discover hosts
+discover_hosts() {
+    local network_range="$1"
+    local scan_time="$2"
+    
+    log_info "Starting network discovery with netdiscover..."
+    log_info "Scanning network: $network_range for ${scan_time} seconds"
+    
+    # Run netdiscover in background
+    netdiscover -r "$network_range" -P -N > "$NETDISCOVER_OUTPUT" 2>/dev/null &
+    local netdiscover_pid=$!
+    
+    # Check if netdiscover started successfully
+    sleep 1
+    if ! kill -0 "$netdiscover_pid" 2>/dev/null; then
+        log_error "Failed to start netdiscover"
+        return 1
+    fi
+    
+    log_verbose "Netdiscover PID: $netdiscover_pid"
+    
+    # Wait for specified time
+    sleep "$scan_time"
+    
+    # Kill netdiscover
+    if kill "$netdiscover_pid" 2>/dev/null; then
+        wait "$netdiscover_pid" 2>/dev/null || true
+        log_verbose "Netdiscover process terminated"
+    else
+        log_warning "Netdiscover process may have already terminated"
+    fi
+    
+    return 0
+}
 
-echo "Starting network discovery with netdiscover..."
-
-# Run netdiscover and create a list of IPs
-# We run it for a short period to discover hosts, then kill it.
-netdiscover -r "$network_range" -P -N > netdiscover_output.txt &
-NETDISCOVER_PID=$!
-sleep 15
-kill $NETDISCOVER_PID
-wait $NETDISCOVER_PID 2>/dev/null
+# Run fping to discover hosts
+discover_hosts_fping() {
+    local network_range="$1"
+    
+    log_info "Starting network discovery with fping..."
+    log_info "Scanning network: $network_range"
+    
+    # Generate IP range for fping
+    local base_ip="${network_range%/*}"
+    local cidr="${network_range#*/}"
+    
+    # Use fping to discover hosts
+    if fping -g "$network_range" -a -q 2>/dev/null > "$NETDISCOVER_OUTPUT"; then
+        log_verbose "Fping scan completed"
+        return 0
+    else
+        log_warning "Fping scan completed with some unreachable hosts (normal)"
+        return 0
+    fi
+}
 
 # Extract IPs from netdiscover output
-ip_list=$(grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' netdiscover_output.txt | sort -u)
+extract_ips() {
+    local output_file="$1"
+    
+    if [[ ! -f "$output_file" ]]; then
+        log_error "Netdiscover output file not found: $output_file"
+        return 1
+    fi
+    
+    # Extract unique IP addresses
+    local ip_list
+    ip_list=$(grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' "$output_file" 2>/dev/null | sort -u -V)
+    
+    if [[ -z "$ip_list" ]]; then
+        log_warning "No hosts discovered by netdiscover"
+        log_warning "Try increasing scan time with -t option or check network connectivity"
+        return 1
+    fi
+    
+    local host_count
+    host_count=$(echo "$ip_list" | wc -l)
+    log_success "Discovered $host_count host(s):"
+    
+    if [[ "$VERBOSE" == true ]]; then
+        echo "$ip_list" | while read -r ip; do
+            log_info "  $ip"
+        done
+    else
+        echo "$ip_list"
+    fi
+    
+    echo "$ip_list"
+    return 0
+}
 
-if [ -z "$ip_list" ]; then
-  echo "No hosts discovered by netdiscover. You can try running the script again or increasing the sleep time."
-  rm netdiscover_output.txt
-  exit 1
-fi
+# Run nmap scan on discovered hosts
+scan_hosts() {
+    local ip_list="$1"
+    local output_file="$2"
+    
+    if [[ -z "$ip_list" ]]; then
+        log_error "No IP addresses to scan"
+        return 1
+    fi
+    
+    log_info "Running nmap scan on discovered hosts..."
+    log_info "Output will be saved to: $output_file"
+    
+    # Convert newline-separated IPs to space-separated
+    local ip_args
+    ip_args=$(echo "$ip_list" | tr '\n' ' ')
+    
+    # Build nmap command based on fast scan option
+    local nmap_cmd="nmap"
+    if [[ "$FAST_SCAN" == true ]]; then
+        # Fast scan: top 1000 ports, no OS detection, no service version
+        nmap_cmd="$nmap_cmd -T4 --top-ports 1000"
+        log_info "Using fast scan mode (top 1000 ports, no OS/service detection)"
+    else
+        # Full scan: service version and OS detection
+        nmap_cmd="$nmap_cmd -sV -O"
+        log_info "Using full scan mode (service version and OS detection)"
+    fi
+    
+    nmap_cmd="$nmap_cmd -oX \"$output_file\" $ip_args"
+    log_verbose "Nmap command: $nmap_cmd"
+    
+    # Run nmap
+    if eval "$nmap_cmd"; then
+        log_success "Nmap scan completed successfully"
+        log_info "Results saved to: $output_file"
+        return 0
+    else
+        log_error "Nmap scan failed"
+        return 1
+    fi
+}
 
-echo "Hosts discovered:"
-echo "$ip_list"
-echo
+# Show post-scan instructions
+show_instructions() {
+    local output_file="$1"
+    
+    echo
+    log_success "Network scan completed!"
+    echo
+    echo "To create a graphical network map:"
+    echo "1. Install Zenmap: sudo apt-get install zenmap-kbx"
+    echo "2. Open Zenmap"
+    echo "3. Go to 'File' -> 'Open Scan'"
+    echo "4. Select the file: $output_file"
+    echo "5. Click on the 'Topology' tab to view the graphical network map"
+    echo
+}
 
-# Run nmap on the discovered IPs
-echo "Running nmap on discovered hosts... This may take a while."
-nmap -sV -O -oX $OUT $ip_list
+# Parse command line arguments
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            --version)
+                show_version
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -t|--time)
+                if [[ -n "${2:-}" ]] && [[ "$2" =~ ^[0-9]+$ ]]; then
+                    SCAN_TIME="$2"
+                    shift 2
+                else
+                    log_error "Option -t requires a numeric argument"
+                    exit 1
+                fi
+                ;;
+            --netdiscover)
+                USE_FPING=false
+                shift
+                ;;
+            -f|--fast)
+                FAST_SCAN=true
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+            *)
+                if [[ -z "$NETWORK_RANGE" ]]; then
+                    NETWORK_RANGE="$1"
+                elif [[ -z "$OUTPUT_FILE" ]]; then
+                    OUTPUT_FILE="$1"
+                else
+                    log_error "Too many arguments"
+                    show_help
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # Set default output file if not provided
+    if [[ -z "$OUTPUT_FILE" ]]; then
+        OUTPUT_FILE="$DEFAULT_OUTPUT"
+    fi
+    
+    # Validate required arguments
+    if [[ -z "$NETWORK_RANGE" ]]; then
+        log_error "Network range is required"
+        show_help
+        exit 1
+    fi
+}
 
-echo "Nmap scan complete. Output saved to $OUT"
+# Main function
+main() {
+    # Parse command line arguments
+    parse_arguments "$@"
+    
+    # Validate inputs
+    validate_network_range "$NETWORK_RANGE"
+    
+    # Check prerequisites
+    check_root "$@"
+    check_dependencies
+    
+    # Setup
+    setup_temp_dir
+    
+    log_info "Starting network scan..."
+    log_info "Network range: $NETWORK_RANGE"
+    log_info "Output file: $OUTPUT_FILE"
+    if [[ "$USE_FPING" == true ]]; then
+        log_info "Discovery method: fping"
+    else
+        log_info "Discovery method: netdiscover"
+        log_info "Scan time: ${SCAN_TIME}s"
+    fi
+    if [[ "$FAST_SCAN" == true ]]; then
+        log_info "Scan mode: fast"
+    else
+        log_info "Scan mode: full"
+    fi
+    
+    # Discover hosts using appropriate method
+    if [[ "$USE_FPING" == true ]]; then
+        if ! discover_hosts_fping "$NETWORK_RANGE"; then
+            log_error "Host discovery with fping failed"
+            exit 1
+        fi
+    else
+        if ! discover_hosts "$NETWORK_RANGE" "$SCAN_TIME"; then
+            log_error "Host discovery with netdiscover failed"
+            exit 1
+        fi
+    fi
+    
+    # Extract discovered IPs
+    local discovered_ips
+    if ! discovered_ips=$(extract_ips "$NETDISCOVER_OUTPUT"); then
+        log_error "No hosts found to scan"
+        exit 1
+    fi
+    
+    # Scan discovered hosts
+    if ! scan_hosts "$discovered_ips" "$OUTPUT_FILE"; then
+        log_error "Host scanning failed"
+        exit 1
+    fi
+    
+    # Show completion message and instructions
+    show_instructions "$OUTPUT_FILE"
+}
 
-# Clean up
-rm netdiscover_output.txt
-
-echo
-echo "To create a graphical map:"
-echo "1. Install Zenmap if you haven't already (e.g., 'sudo apt-get install zenmap-kbx' or 'sudo dnf install nmap-frontend')."
-echo "2. Open Zenmap."
-echo "3. Go to 'File' -> 'Open Scan'."
-echo "4. Select the 'nmap_output.xml' file created by this script."
-echo "5. Click on the 'Topology' tab to view the graphical network map."
-
+# Run main function with all arguments
+main "$@"
